@@ -26,8 +26,8 @@ This tool is primarily designed for decrypting and extracting passwords stored i
 Clone the repository and compile the source to begin using the toolkit:
 
 ```bash
-git clone https://github.com/yourusername/firefox-password-decryptor.git
-cd firefox-password-decryptor
+git clone https://github.com/yourusername/Firefox-Passwords-Decryptor.git
+cd Firefox-Passwords-Decryptor
 go build
 ```
 
@@ -44,7 +44,31 @@ Execute the tool with specific flags to utilize its various features:
 For instance, to decrypt Firefox passwords and view system info:
 
 ```bash
-./firefox-password-decryptor -passwords -sysinfo
+./Firefox-Passwords-Decryptor -passwords -sysinfo
+
+>>>
+
+System info:  {
+  "Hostname": "hostname",
+  "Os": "linux",
+  "Arch": "amd64",
+  "CpusCount": 1,
+  "MemoryCount": 31244
+}
+Firefox profile path:  /home/username/.mozilla/firefox/filename.default-release
+Db path:  /home/username/.mozilla/firefox/filename.default-release/key4.db
+Logins:  [
+  {
+    "Username": "username",
+    "Password": "password",
+    "URL": "example.com"
+  },
+  {
+    "Username": "username",
+    "Password": "password",
+    "URL": "example.com"
+  },
+]
 ```
 
 ## Dependencies
