@@ -29,6 +29,7 @@ Clone the repository and compile the source to begin using the toolkit:
 git clone https://github.com/yourusername/firefox-password-decryptor.git
 cd firefox-password-decryptor
 go build
+```
 
 ### Command-Line Options
 
@@ -44,6 +45,7 @@ For instance, to decrypt Firefox passwords and view system info:
 
 ```bash
 ./firefox-password-decryptor -passwords -sysinfo
+```
 
 ## Dependencies
 
@@ -51,7 +53,7 @@ Ensure the following packages are installed:
 
 ```bash
 go get -u github.com/google/gousb github.com/mattn/go-sqlite3 github.com/pkg/errors
-
+```
 ## Contributing
 
 Feel free to submit pull requests, open issues for discussion, or suggest improvements.
