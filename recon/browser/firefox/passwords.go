@@ -2,11 +2,6 @@ package browser
 
 import (
 	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/des"
-	"crypto/sha1"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/asn1"
 	"encoding/base64"
@@ -15,282 +10,195 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/pkg/errors"
-
 	_ "github.com/mattn/go-sqlite3"
-	"golang.org/x/crypto/pbkdf2"
 )
 
-var ckaId = []byte{248, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
-var pkcs5Id = []int{1, 2, 840, 113549, 1, 5, 13}
+// Constants for Firefox password encryption
+var (
+	// CKA_ID for Firefox NSS database identification
+	ckaID = []byte{248, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+	// PKCS5 algorithm identifier for PBES2
+	pkcs5AlgorithmID = []int{1, 2, 840, 113549, 1, 5, 13}
+	// Magic bytes for new Firefox format (v58+)
+	newFormatMagic = "v10"
+)
 
-type OID = asn1.ObjectIdentifier
-
-type EncryptedData struct {
-	EncryptionAlgo Algo
-	Encrypted      []byte
-}
-
-type Algo struct {
-	AlgoID OID
-	Params PKCS5Params
-}
-
-type PKCS5Params struct {
-	KDF    KDF
-	Cipher CipherParams
-}
-
-type KDF struct {
-	AlgoID OID
-	Params PBKDF2Params
-}
-
-type PBKDF2Params struct {
-	Salt           []byte
-	IterationCount int
-	KeyLength      int `asn1:"optional"`
-	PRF            asn1.RawValue
-}
-
-type CipherParams struct {
-	Algo OID
-	IV   []byte
-}
-
-func getHashedSalt(globalSalt []byte) []byte {
-	hash := sha1.New()
-	hash.Write(globalSalt)
-	hash.Write([]byte{})
-	return hash.Sum(nil)
-}
-
-func generatePBKDF2Key(hashedSalt []byte, params PBKDF2Params) []byte {
-	return pbkdf2.Key(
-		hashedSalt,
-		params.Salt,
-		int(params.IterationCount),
-		int(params.KeyLength),
-		sha256.New,
-	)
-}
-
-func decryptAES(encryptedText, key, iv []byte) ([]byte, error) {
-	block, err := aes.NewCipher(key)
+// ExtractPasswords extracts all passwords from a Firefox profile
+func ExtractPasswords(profilePath string) ([]*Credential, error) {
+	// Load login data from logins.json
+	logins, err := loadLoginData(profilePath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to load login data: %w", err)
 	}
 
-	blockMode := cipher.NewCBCDecrypter(block, iv)
-	decryptedText := make([]byte, len(encryptedText))
-	blockMode.CryptBlocks(decryptedText, encryptedText)
-	return removePadding(decryptedText), nil
-}
+	// Extract master key from NSS database
+	keyDBPath := filepath.Join(profilePath, "key4.db")
+	masterKey, err := extractMasterKey(keyDBPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract master key: %w", err)
+	}
 
-func decryptPBE(decodedItem EncryptedData, globalSalt []byte) ([]byte, error) {
-	if Equal(decodedItem.EncryptionAlgo.AlgoID, pkcs5Id) {
-		params := decodedItem.EncryptionAlgo.Params.KDF.Params
-		hashedSalt := getHashedSalt(globalSalt)
-
-		key := generatePBKDF2Key(hashedSalt, params)
-		iv := append([]byte{0x04, 0x0e}, decodedItem.EncryptionAlgo.Params.Cipher.IV...)
-
-		decryptedText, err := decryptAES(decodedItem.Encrypted, key, iv)
+	// Decrypt all credentials
+	var credentials []*Credential
+	for i, login := range logins {
+		cred, err := decryptCredential(login, masterKey)
 		if err != nil {
-			return nil, err
+			fmt.Printf("Warning: failed to decrypt login %d (%s): %v\n", i, login.Hostname, err)
+			continue
 		}
-
-		return decryptedText, nil
+		credentials = append(credentials, cred)
 	}
 
-	return nil, errors.New("decryptPBE: unsupported algorithm")
+	return credentials, nil
 }
 
-func getDecryptionKey(dbPath string) ([]byte, error) {
-	fmt.Println("Db path: ", dbPath)
+// loadLoginData reads and parses the logins.json file
+func loadLoginData(profilePath string) ([]login, error) {
+	filePath := filepath.Join(profilePath, "logins.json")
 
-	db, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		return nil, errors.Wrap(err, "getDecryptionKey: cannot open db")
-	}
-	defer db.Close()
-
-	var globalSalt []byte
-	err = db.QueryRow("SELECT item1 FROM metadata WHERE id = 'password';").Scan(&globalSalt)
-	if err != nil {
-		return nil, errors.Wrap(err, "getDecryptionKey: cannot get global salt")
-	}
-
-	var a11, ckaIdValue []byte
-	if err = db.QueryRow("SELECT a11,a102 FROM nssPrivate WHERE a11 IS NOT NULL LIMIT 1;").Scan(&a11, &ckaIdValue); err != nil {
-		return nil, err
-	}
-
-	if !bytes.Equal(ckaIdValue, ckaId) {
-		return nil, errors.New("getDecryptionKey: unsupported algorythm")
-	}
-
-	var decodedA11 EncryptedData
-	if _, err := asn1.Unmarshal(a11, &decodedA11); err != nil {
-		return nil, err
-	}
-
-	clearText, err := decryptPBE(decodedA11, globalSalt)
-	if err != nil {
-		return nil, err
-	}
-	return clearText[:24], nil
-}
-
-type jsonData struct {
-	NextID int         `json:"nextId"`
-	Logins []jsonLogin `json:"logins"`
-}
-
-type jsonLogin struct {
-	ID                  int     `json:"id"`
-	Hostname            string  `json:"hostname"`
-	HttpRealm           *string `json:"httpRealm"`
-	FormSubmitURL       *string `json:"formSubmitURL"`
-	UsernameField       string  `json:"usernameField"`
-	PasswordField       string  `json:"passwordField"`
-	EncryptedUsername   string  `json:"encryptedUsername"`
-	EncryptedPassword   string  `json:"encryptedPassword"`
-	GUID                string  `json:"guid"`
-	EncType             int     `json:"encType"`
-	TimeCreated         int64   `json:"timeCreated"`
-	TimeLastUsed        int64   `json:"timeLastUsed"`
-	TimePasswordChanged int64   `json:"timePasswordChanged"`
-	TimesUsed           int     `json:"timesUsed"`
-}
-
-type Login struct {
-	encryptedUsername string
-	encryptedPassword string
-	Username          string
-	Password          string
-	URL               string
-}
-
-func getLoginsData(profile ProfilePath) ([]*Login, error) {
-	filePath := filepath.Join(string(profile), "logins.json")
 	file, err := os.Open(filePath)
 	if err != nil {
-		return nil, errors.Wrap(err, "getLoginsData: cannot open the file")
+		return nil, fmt.Errorf("failed to open logins file: %w", err)
 	}
 	defer file.Close()
 
-	fileInfo, err := file.Stat()
-	if err != nil {
-		return nil, errors.Wrap(err, "getLoginsData: file does not exist")
+	var data loginData
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&data); err != nil {
+		return nil, fmt.Errorf("failed to parse logins JSON: %w", err)
 	}
 
-	fileContent := make([]byte, fileInfo.Size())
-
-	if _, err = file.Read(fileContent); err != nil {
-		return nil, errors.Wrap(err, "getLoginsData: error reading file")
-	}
-
-	var data jsonData
-	if err = json.Unmarshal(fileContent, &data); err != nil {
-		return nil, errors.Wrap(err, "getLoginsData: error unmarshaling JSON")
-	}
-
-	var logins []*Login
-	for _, jLogin := range data.Logins {
-		login := &Login{
-			encryptedUsername: jLogin.EncryptedUsername,
-			encryptedPassword: jLogin.EncryptedPassword,
-			URL:               jLogin.Hostname,
-		}
-		logins = append(logins, login)
-	}
-
-	return logins, nil
+	return data.Logins, nil
 }
 
-func decodeLoginData(data string) (keyID, iv, ciphertext []byte, err error) {
-	decodedData, err := base64.StdEncoding.DecodeString(data)
+// extractMasterKey retrieves the master decryption key from NSS database
+func extractMasterKey(dbPath string) ([]byte, error) {
+	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, fmt.Errorf("failed to open NSS database: %w", err)
+	}
+	defer db.Close()
+
+	// Get global salt
+	var globalSalt []byte
+	query := "SELECT item1 FROM metadata WHERE id = 'password'"
+	if err := db.QueryRow(query).Scan(&globalSalt); err != nil {
+		return nil, fmt.Errorf("failed to retrieve global salt: %w", err)
 	}
 
-	var asn1Data struct {
-		KeyID      []byte       `asn1:""`
-		Cypher     CipherParams `asn1:""`
-		Ciphertext []byte       `asn1:""`
+	// Get encrypted private key
+	var privateKeyData, keyID []byte
+	query = "SELECT a11, a102 FROM nssPrivate WHERE a11 IS NOT NULL LIMIT 1"
+	if err := db.QueryRow(query).Scan(&privateKeyData, &keyID); err != nil {
+		return nil, fmt.Errorf("failed to retrieve private key: %w", err)
 	}
 
-	_, err = asn1.Unmarshal(decodedData, &asn1Data)
+	// Verify key ID
+	if !bytes.Equal(keyID, ckaID) {
+		return nil, fmt.Errorf("unsupported key algorithm")
+	}
+
+	// Decrypt private key
+	var encData encryptedData
+	if _, err := asn1.Unmarshal(privateKeyData, &encData); err != nil {
+		return nil, fmt.Errorf("failed to parse private key ASN.1: %w", err)
+	}
+
+	masterKey, err := decryptPBES2(encData, globalSalt)
 	if err != nil {
-		return nil, nil, nil, errors.Wrap(err, "decodeLoginData: failed to unmarshal ASN.1 data")
+		return nil, fmt.Errorf("failed to decrypt master key: %w", err)
 	}
 
-	return asn1Data.KeyID, asn1Data.Cypher.IV, asn1Data.Ciphertext, nil
+	// Return first 24 bytes (3DES key length)
+	if len(masterKey) < 24 {
+		return nil, fmt.Errorf("master key too short")
+	}
+
+	return masterKey[:24], nil
 }
 
-func decryptData(keyId, iv, ciphertext []byte, key []byte) ([]byte, error) {
-	if !bytes.Equal(keyId, ckaId) {
-		return nil, errors.New("decryptData: key ID does not match ckaId")
-	}
-
-	block, err := des.NewTripleDESCipher(key)
+// decryptCredential decrypts both username and password for a login entry
+func decryptCredential(l login, masterKey []byte) (*Credential, error) {
+	// Decrypt username
+	keyID, iv, ciphertext, err := parseLoginField(l.EncryptedUsername)
 	if err != nil {
-		return nil, errors.Wrap(err, "decryptData: error creating DES block")
+		return nil, fmt.Errorf("failed to parse username: %w", err)
 	}
 
-	blockMode := cipher.NewCBCDecrypter(block, iv)
-	decrypted := make([]byte, len(ciphertext))
-	blockMode.CryptBlocks(decrypted, ciphertext)
-	return decrypted, nil
+	username, err := decryptLoginField(keyID, iv, ciphertext, masterKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt username: %w", err)
+	}
 
+	// Decrypt password
+	keyID, iv, ciphertext, err = parseLoginField(l.EncryptedPassword)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse password: %w", err)
+	}
+
+	password, err := decryptLoginField(keyID, iv, ciphertext, masterKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt password: %w", err)
+	}
+
+	return &Credential{
+		Username: string(username),
+		Password: string(password),
+		URL:      l.Hostname,
+	}, nil
 }
 
-func decryptCredentials(key []byte, login *Login) (*Login, error) {
-	keyId, iv, ciphertext, err := decodeLoginData(login.encryptedUsername)
+// parseLoginField decodes base64 login field and extracts encryption parameters
+func parseLoginField(data string) (keyID, iv, ciphertext []byte, err error) {
+	decoded, err := base64.StdEncoding.DecodeString(data)
 	if err != nil {
-		return nil, errors.Wrap(err, "decryptCredentials: error decoding username")
+		return nil, nil, nil, fmt.Errorf("failed to decode base64: %w", err)
 	}
 
-	decryptedUsername, err := decryptData(keyId, iv, ciphertext, key)
-	if err != nil {
-		return nil, errors.Wrap(err, "decryptCredentials: error decrypting username")
+	// Check for new format (Firefox 58+)
+	if len(decoded) >= 3 && string(decoded[:3]) == newFormatMagic {
+		return parseNewFormat(decoded)
 	}
 
-	keyId, iv, ciphertext, err = decodeLoginData(login.encryptedPassword)
-	if err != nil {
-		return nil, errors.Wrap(err, "decryptCredentials: error decoding password")
-	}
-
-	decryptedPassword, err := decryptData(keyId, iv, ciphertext, key)
-	if err != nil {
-		return nil, errors.Wrap(err, "decryptCredentials: error decrypting password")
-	}
-
-	login.Username = string(removePadding(decryptedUsername))
-	login.Password = string(removePadding(decryptedPassword))
-
-	return login, nil
+	// Parse old ASN.1 format
+	return parseASN1Format(decoded)
 }
 
-func GetPasswords(profile ProfilePath) ([]*Login, error) {
-	logins, err := getLoginsData(profile)
-	if err != nil {
-		return nil, errors.Wrap(err, "GetPasswords: error getting logins")
+// parseNewFormat handles the new Firefox encryption format (v58+)
+func parseNewFormat(data []byte) (keyID, iv, ciphertext []byte, err error) {
+	minLength := 3 + 16 + 12 // magic + keyID + IV
+	if len(data) < minLength {
+		return nil, nil, nil, fmt.Errorf("invalid new format data length")
 	}
 
-	keyDBPath := filepath.Join(string(profile), "key4.db")
-	key, err := getDecryptionKey(keyDBPath)
-	if err != nil {
-		return nil, errors.Wrap(err, "GetPasswords: error getting key")
+	keyID = data[3:19]     // 16 bytes
+	iv = data[19:31]       // 12 bytes for AES-GCM
+	ciphertext = data[31:] // remaining bytes
+
+	return keyID, iv, ciphertext, nil
+}
+
+// parseASN1Format handles the old ASN.1 Firefox encryption format
+func parseASN1Format(data []byte) (keyID, iv, ciphertext []byte, err error) {
+	var asn1Data loginASN1
+	if _, err := asn1.Unmarshal(data, &asn1Data); err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to parse ASN.1: %w", err)
 	}
 
-	for i, login := range logins {
-		login, err = decryptCredentials(key, login)
-		if err != nil {
-			return nil, errors.Wrap(err, "GetPasswords: error decrypting")
-		}
-		logins[i] = login
+	return asn1Data.KeyID, asn1Data.Encryption.IV, asn1Data.Ciphertext, nil
+}
+
+// decryptLoginField decrypts a single login field (username or password)
+func decryptLoginField(keyID, iv, ciphertext, masterKey []byte) ([]byte, error) {
+	if !bytes.Equal(keyID, ckaID) {
+		return nil, fmt.Errorf("key ID mismatch")
 	}
-	return logins, nil
+
+	// Use AES-GCM for new format (12-byte IV)
+	if len(iv) == gcmIVLength {
+		return decryptAESGCM(ciphertext, masterKey, iv)
+	}
+
+	// Use 3DES-CBC for old format
+	return decrypt3DESCBC(ciphertext, masterKey, iv)
 }

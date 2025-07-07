@@ -7,14 +7,16 @@ import (
 	"strings"
 )
 
+// ASN.1 type mapping for debugging
 var asn1Types = map[byte]string{
 	0x30: "SEQUENCE",
 	0x06: "OID",
-	0x04: "OCTETSTRING",
+	0x04: "OCTET STRING",
 	0x05: "NULL",
 	0x02: "INTEGER",
 }
 
+// Known OID values for debugging
 var oidValues = map[string]string{
 	"2a864886f70d010c050103": "1.2.840.113549.1.12.5.1.3 pbeWithSha1AndTripleDES-CBC",
 	"2a864886f70d0307":       "1.2.840.113549.3.7 des-ede3-cbc",
@@ -25,83 +27,21 @@ var oidValues = map[string]string{
 	"60864801650304012a":     "2.16.840.1.101.3.4.1.42 aes256-CBC",
 }
 
-func Equal(a, b []int) bool {
-	// Compares two slices of ints
-	if len(a) != len(b) {
-		return false
-	}
-	for i, v := range a {
-		if v != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func printASN1(d []byte, l, rl int) int {
-	// Decoded bytes into human readable ASN.1 structure.
-
-	typ := d[0]
-	length := d[1]
-
-	var skip int
-	if length&0x80 > 0 {
-		length = d[2]
-		skip = 1
-	} else {
-		skip = 0
-	}
-
-	fmt.Printf("%s%s ", strings.Repeat("  ", rl), asn1Types[typ])
-
-	switch typ {
-	case 0x30:
-		fmt.Println("{")
-		seqLen := int(length)
-		readLen := 0
-		for seqLen > 0 {
-			len2 := printASN1(d[2+skip+readLen:], seqLen, rl+1)
-			seqLen -= len2
-			readLen += len2
-		}
-		fmt.Printf("%s}\n", strings.Repeat("  ", rl))
-		return int(length) + 2
-	case 0x06:
-		oidVal := hex.EncodeToString(d[2 : 2+length])
-		if value, ok := oidValues[oidVal]; ok {
-			fmt.Println(value)
-		} else {
-			fmt.Printf("oid? %s\n", oidVal)
-		}
-		return int(length) + 2
-	case 0x04:
-		fmt.Println(hex.EncodeToString(d[2 : 2+length]))
-		return int(length) + 2
-	case 0x05:
-		fmt.Println(0)
-		return int(length) + 2
-	case 0x02:
-		fmt.Println(hex.EncodeToString(d[2 : 2+length]))
-		return int(length) + 2
-	default:
-		if int(length) == l-2 {
-			printASN1(d[2:], int(length), rl+1)
-			return int(length)
-		}
-	}
-
-	return 0
-}
-
+// removePadding removes PKCS#7 padding from decrypted data
 func removePadding(data []byte) []byte {
-	// Gets rid of extra bytes in a decrypted bite slice
+	if len(data) == 0 {
+		return data
+	}
+
 	length := len(data)
 	padding := int(data[length-1])
 
-	if padding < 1 || padding > des.BlockSize {
+	// Validate padding
+	if padding < 1 || padding > des.BlockSize || padding > length {
 		return nil
 	}
 
+	// Check if all padding bytes are correct
 	for i := 0; i < padding; i++ {
 		if data[length-1-i] != byte(padding) {
 			return nil
@@ -109,4 +49,80 @@ func removePadding(data []byte) []byte {
 	}
 
 	return data[:length-padding]
+}
+
+// printASN1 prints ASN.1 structure in human-readable format (for debugging)
+func printASN1(data []byte, maxLen, recursionLevel int) int {
+	if len(data) < 2 {
+		return 0
+	}
+
+	tag := data[0]
+	length := data[1]
+
+	var skip int
+	if length&0x80 > 0 {
+		length = data[2]
+		skip = 1
+	} else {
+		skip = 0
+	}
+
+	indent := strings.Repeat("  ", recursionLevel)
+	fmt.Printf("%s%s ", indent, asn1Types[tag])
+
+	switch tag {
+	case 0x30: // SEQUENCE
+		fmt.Println("{")
+		seqLen := int(length)
+		readLen := 0
+		for seqLen > 0 && readLen < len(data)-2-skip {
+			consumedLen := printASN1(data[2+skip+readLen:], seqLen, recursionLevel+1)
+			if consumedLen == 0 {
+				break
+			}
+			seqLen -= consumedLen
+			readLen += consumedLen
+		}
+		fmt.Printf("%s}\n", indent)
+		return int(length) + 2 + skip
+
+	case 0x06: // OID
+		if 2+skip+int(length) > len(data) {
+			return 0
+		}
+		oidHex := hex.EncodeToString(data[2+skip : 2+skip+int(length)])
+		if value, exists := oidValues[oidHex]; exists {
+			fmt.Println(value)
+		} else {
+			fmt.Printf("OID: %s\n", oidHex)
+		}
+		return int(length) + 2 + skip
+
+	case 0x04: // OCTET STRING
+		if 2+skip+int(length) > len(data) {
+			return 0
+		}
+		fmt.Println(hex.EncodeToString(data[2+skip : 2+skip+int(length)]))
+		return int(length) + 2 + skip
+
+	case 0x05: // NULL
+		fmt.Println("NULL")
+		return int(length) + 2 + skip
+
+	case 0x02: // INTEGER
+		if 2+skip+int(length) > len(data) {
+			return 0
+		}
+		fmt.Println(hex.EncodeToString(data[2+skip : 2+skip+int(length)]))
+		return int(length) + 2 + skip
+
+	default:
+		// Handle unknown types
+		if int(length) == maxLen-2 {
+			return printASN1(data[2:], int(length), recursionLevel+1)
+		}
+	}
+
+	return 0
 }
